@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
+    <AssemblyName>EmbyUserControl</AssemblyName>
+    <RootNamespace>EmbyUserControl</RootNamespace>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>1.0.0.$([System.DateTime]::UtcNow.ToString("ddHHmm"))</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 引用 Emby 核心的 NuGet 包 -->
+    <PackageReference Include="MediaBrowser.Server.Core" Version="4.8.0.80" />
+    <PackageReference Include="System.Memory" Version="4.5.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 将配置文件作为嵌入资源打包进 DLL -->
+    <EmbeddedResource Include="Configuration/configPage.html" />
+    <EmbeddedResource Include="Configuration/configPage.js" />
+    <EmbeddedResource Include="thumb.png" />
+  </ItemGroup>
+
+</Project>
