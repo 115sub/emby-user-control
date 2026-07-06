@@ -260,22 +260,39 @@ namespace EmbyUserControl
                 _logger.Warn($"向 Session {session.Id} 发送 PlaystateCommand Stop 失败: {ex.Message}");
             }
 
-            // 3. 物理切断播放权限 (UserPolicy)
+            // 3. 物理切断播放权限与远程访问权限 (UserPolicy)
             var user = _userManager.Users.FirstOrDefault(u => string.Equals(u.Name, username, StringComparison.OrdinalIgnoreCase));
             if (user != null)
             {
                 try
                 {
                     var policy = user.Policy;
+                    var changed = false;
                     if (policy.EnableMediaPlayback)
                     {
                         policy.EnableMediaPlayback = false;
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
+                        changed = true;
                         _logger.Info($"已关闭用户 [{username}] 的播放权限。");
                     }
                     else
                     {
                         _logger.Info($"用户 [{username}] 的播放权限已经处于关闭状态，无需重复关闭。");
+                    }
+
+                    if (policy.EnableRemoteAccess)
+                    {
+                        policy.EnableRemoteAccess = false;
+                        changed = true;
+                        _logger.Info($"已关闭用户 [{username}] 的远程访问权限。");
+                    }
+                    else
+                    {
+                        _logger.Info($"用户 [{username}] 的远程访问权限已经处于关闭状态，无需重复关闭。");
+                    }
+
+                    if (changed)
+                    {
+                        _userManager.UpdateUserPolicy(user.InternalId, policy);
                     }
                 }
                 catch (Exception ex)
@@ -302,18 +319,37 @@ namespace EmbyUserControl
                 }
             }
 
-            // 恢复所有用户的播放权限
+            // 恢复受限用户的播放权限与远程访问权限
             var allUsers = _userManager.Users.ToList();
-            foreach (var user in allUsers)
+            foreach (var limit in Plugin.Instance.Configuration.UserLimits)
             {
+                var user = allUsers.FirstOrDefault(u => string.Equals(u.Name, limit.Username, StringComparison.OrdinalIgnoreCase));
+                if (user == null)
+                {
+                    continue;
+                }
+
                 try
                 {
                     var policy = user.Policy;
+                    var changed = false;
                     if (!policy.EnableMediaPlayback)
                     {
                         policy.EnableMediaPlayback = true;
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
+                        changed = true;
                         _logger.Info($"[跨日重置] 已恢复用户 [{user.Name}] 的播放权限。");
+                    }
+
+                    if (!policy.EnableRemoteAccess)
+                    {
+                        policy.EnableRemoteAccess = true;
+                        changed = true;
+                        _logger.Info($"[跨日重置] 已恢复用户 [{user.Name}] 的远程访问权限。");
+                    }
+
+                    if (changed)
+                    {
+                        _userManager.UpdateUserPolicy(user.InternalId, policy);
                     }
                 }
                 catch (Exception ex)
@@ -340,17 +376,36 @@ namespace EmbyUserControl
                 try
                 {
                     var policy = user.Policy;
+                    var changed = false;
                     if (hasExceeded && policy.EnableMediaPlayback)
                     {
                         policy.EnableMediaPlayback = false;
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
+                        changed = true;
                         _logger.Info($"[状态自愈] 用户 [{username}] 已超时但权限未关闭，执行补锁关闭权限。");
                     }
                     else if (!hasExceeded && !policy.EnableMediaPlayback)
                     {
                         policy.EnableMediaPlayback = true;
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
+                        changed = true;
                         _logger.Info($"[状态自愈] 用户 [{username}] 未超时但权限处于关闭状态，执行解锁开放权限。");
+                    }
+
+                    if (hasExceeded && policy.EnableRemoteAccess)
+                    {
+                        policy.EnableRemoteAccess = false;
+                        changed = true;
+                        _logger.Info($"[状态自愈] 用户 [{username}] 已超时但远程访问未关闭，执行补锁关闭远程访问。");
+                    }
+                    else if (!hasExceeded && !policy.EnableRemoteAccess)
+                    {
+                        policy.EnableRemoteAccess = true;
+                        changed = true;
+                        _logger.Info($"[状态自愈] 用户 [{username}] 未超时但远程访问处于关闭状态，执行解锁开放远程访问。");
+                    }
+
+                    if (changed)
+                    {
+                        _userManager.UpdateUserPolicy(user.InternalId, policy);
                     }
                 }
                 catch (Exception ex)
