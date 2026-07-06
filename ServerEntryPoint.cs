@@ -482,23 +482,43 @@ namespace EmbyUserControl
                 }
             }
 
-            // 2. 修复非限制列表中的用户，防止其权限异常残留为 false
+            // 2. 修复已从限制列表移除的用户，防止插件锁定状态异常残留。
             foreach (var user in allUsers)
             {
                 string username = user.Name;
                 bool isLimited = Plugin.Instance.Configuration.UserLimits
                     .Any(l => string.Equals(l.Username, username, StringComparison.OrdinalIgnoreCase));
 
-                if (!isLimited)
+                if (!isLimited && HasPlayRecord(username))
                 {
                     try
                     {
                         var policy = user.Policy;
+                        var changed = false;
                         if (!policy.EnableMediaPlayback)
                         {
                             policy.EnableMediaPlayback = true;
-                            _userManager.UpdateUserPolicy(user.InternalId, policy);
+                            changed = true;
                             _logger.Info($"[自愈修复] 发现未受限普通用户 [{username}] 的播放权限被禁用，现已自动恢复开启。");
+                        }
+
+                        if (!policy.EnableRemoteAccess)
+                        {
+                            policy.EnableRemoteAccess = true;
+                            changed = true;
+                            _logger.Info($"[自愈修复] 发现已移除限制用户 [{username}] 的远程访问被禁用，现已自动恢复开启。");
+                        }
+
+                        if (policy.IsDisabled)
+                        {
+                            policy.IsDisabled = false;
+                            changed = true;
+                            _logger.Info($"[自愈修复] 发现已移除限制用户 [{username}] 仍处于禁用状态，现已自动解除禁用。");
+                        }
+
+                        if (changed)
+                        {
+                            _userManager.UpdateUserPolicy(user.InternalId, policy);
                         }
                     }
                     catch (Exception ex)
@@ -507,6 +527,11 @@ namespace EmbyUserControl
                     }
                 }
             }
+        }
+
+        private bool HasPlayRecord(string username)
+        {
+            return _playRecords.Any(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase));
         }
 
         private void LogConfiguredUserRemainingTimes(string today, string stage)

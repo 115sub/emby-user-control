@@ -174,12 +174,7 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
     function onSubmit(instance, e) {
         e.preventDefault();
 
-        if (!instance.limits.length) {
-            setStatus(instance.view, '还没有可保存的受限用户。请先点击“加入列表”，再保存配置。', 'isWarning');
-            return false;
-        }
-
-        if (!isKnownDraft(instance)) {
+        if (instance.limits.length && !isKnownDraft(instance)) {
             setStatus(instance.view, '当前输入区的用户尚未加入列表；本次只保存上方列表中的规则。', 'isWarning');
         }
 
@@ -194,7 +189,7 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
             return ApiClient.updatePluginConfiguration(pluginId, config);
         }).then(function () {
             loading.hide();
-            setStatus(instance.view, '配置已保存。', 'isOk');
+            setStatus(instance.view, instance.limits.length ? '配置已保存。' : '已保存空限制列表，后台将恢复已移除用户的权限。', 'isOk');
             Dashboard.processPluginConfigurationUpdateResult();
         });
 
