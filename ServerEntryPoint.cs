@@ -238,10 +238,26 @@ namespace EmbyUserControl
             try
             {
                 _sessionManager.SendGeneralCommand(null, session.Id, stopCommand, CancellationToken.None);
+                _logger.Info($"已向 Session {session.Id} 发送 GeneralCommand Stop。");
             }
             catch (Exception ex)
             {
                 _logger.Warn($"向 Session {session.Id} 发送 Stop 播放命令失败: {ex.Message}");
+            }
+
+            var playstateStopCommand = new PlaystateRequest
+            {
+                Command = PlaystateCommand.Stop
+            };
+
+            try
+            {
+                _sessionManager.SendPlaystateCommand(null, session.Id, playstateStopCommand, CancellationToken.None);
+                _logger.Info($"已向 Session {session.Id} 发送 PlaystateCommand Stop。");
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"向 Session {session.Id} 发送 PlaystateCommand Stop 失败: {ex.Message}");
             }
 
             // 3. 物理切断播放权限 (UserPolicy)
