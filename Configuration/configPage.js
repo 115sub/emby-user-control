@@ -46,16 +46,39 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
         status.textContent = message || '';
     }
 
+    function formatUserLabel(user) {
+        var badges = [];
+        if (user.IsDisabled) {
+            badges.push('已禁用');
+        }
+        if (user.IsHidden) {
+            badges.push('隐藏');
+        }
+        if (user.EnableMediaPlayback === false) {
+            badges.push('播放关闭');
+        }
+        if (user.EnableRemoteAccess === false) {
+            badges.push('远程关闭');
+        }
+
+        return user.Name + (badges.length ? '（' + badges.join(' / ') + '）' : '');
+    }
+
     function loadUsers(view) {
-        return ApiClient.getUsers().then(function (users) {
+        return ApiClient.getJSON(ApiClient.getUrl('EmbyUserControl/Users')).then(function (result) {
+            var users = result && result.Items ? result.Items : [];
             var select = view.querySelector('#selectUser');
             if (!select) {
                 return;
             }
 
             select.innerHTML = (users || []).map(function (user) {
-                return user.Name ? '<option value="' + escapeHtml(user.Name) + '">' + escapeHtml(user.Name) + '</option>' : '';
+                return user.Name ? '<option value="' + escapeHtml(user.Name) + '">' + escapeHtml(formatUserLabel(user)) + '</option>' : '';
             }).join('');
+
+            if (!users.length) {
+                select.innerHTML = '<option value="">未找到用户</option>';
+            }
         });
     }
 

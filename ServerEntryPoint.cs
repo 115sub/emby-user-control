@@ -290,6 +290,17 @@ namespace EmbyUserControl
                         _logger.Info($"用户 [{username}] 的远程访问权限已经处于关闭状态，无需重复关闭。");
                     }
 
+                    if (!policy.IsDisabled)
+                    {
+                        policy.IsDisabled = true;
+                        changed = true;
+                        _logger.Info($"已临时禁用用户 [{username}]，阻止客户端重新登录换取新 Token。");
+                    }
+                    else
+                    {
+                        _logger.Info($"用户 [{username}] 已经处于禁用状态，无需重复禁用。");
+                    }
+
                     if (changed)
                     {
                         _userManager.UpdateUserPolicy(user.InternalId, policy);
@@ -303,6 +314,43 @@ namespace EmbyUserControl
             else
             {
                 _logger.Warn($"尝试关闭用户 [{username}] 的播放权限，但未在用户列表中找到该用户。");
+            }
+
+            RevokeUserAccess(username, user);
+        }
+
+        private void RevokeUserAccess(string username, MediaBrowser.Controller.Entities.User user)
+        {
+            if (user == null)
+            {
+                return;
+            }
+
+            try
+            {
+                _sessionManager.RevokeUserTokens(user.InternalId, null);
+                _logger.Info($"已通过 SessionManager 撤销用户 [{username}] 的所有访问 Token。UserInternalId={user.InternalId}。");
+            }
+            catch (Exception ex)
+            {
+                _logger.ErrorException($"撤销用户 [{username}] 访问 Token 失败: ", ex);
+            }
+
+            var userSessions = _sessionManager.Sessions
+                .Where(s => string.Equals(s.UserName, username, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (var activeSession in userSessions)
+            {
+                try
+                {
+                    _sessionManager.ReportSessionEnded(activeSession.Id);
+                    _logger.Info($"已标记用户 [{username}] 的 Session 结束。SessionId={activeSession.Id}，Client={activeSession.Client}，DeviceName={activeSession.DeviceName}。");
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"标记 Session {activeSession.Id} 结束失败: {ex.Message}");
+                }
             }
         }
 
@@ -345,6 +393,13 @@ namespace EmbyUserControl
                         policy.EnableRemoteAccess = true;
                         changed = true;
                         _logger.Info($"[跨日重置] 已恢复用户 [{user.Name}] 的远程访问权限。");
+                    }
+
+                    if (policy.IsDisabled)
+                    {
+                        policy.IsDisabled = false;
+                        changed = true;
+                        _logger.Info($"[跨日重置] 已解除用户 [{user.Name}] 的临时禁用状态。");
                     }
 
                     if (changed)
@@ -401,6 +456,19 @@ namespace EmbyUserControl
                         policy.EnableRemoteAccess = true;
                         changed = true;
                         _logger.Info($"[状态自愈] 用户 [{username}] 未超时但远程访问处于关闭状态，执行解锁开放远程访问。");
+                    }
+
+                    if (hasExceeded && !policy.IsDisabled)
+                    {
+                        policy.IsDisabled = true;
+                        changed = true;
+                        _logger.Info($"[状态自愈] 用户 [{username}] 已超时但未被禁用，执行补锁禁用以阻止重新登录。");
+                    }
+                    else if (!hasExceeded && policy.IsDisabled)
+                    {
+                        policy.IsDisabled = false;
+                        changed = true;
+                        _logger.Info($"[状态自愈] 用户 [{username}] 未超时但处于禁用状态，执行解锁允许登录。");
                     }
 
                     if (changed)

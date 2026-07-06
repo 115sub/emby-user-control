@@ -10,8 +10,8 @@
 
   <ItemGroup>
     <!-- 引用 Emby 核心的 NuGet 包 -->
-    <PackageReference Include="MediaBrowser.Server.Core" Version="4.8.0.80" />
-    <PackageReference Include="System.Memory" Version="4.5.5" />
+    <PackageReference Include="MediaBrowser.Server.Core" Version="4.9.1.90" />
+    <PackageReference Include="System.Memory" Version="4.6.3" />
   </ItemGroup>
 
   <ItemGroup>
