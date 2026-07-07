@@ -28,6 +28,7 @@ namespace EmbyUserControl
         private string _lastCheckedDate;
         private string _recordsFilePath;
         private DateTime _lastTimerRunUtc;
+        private bool _recordsDirty;
 
         public ServerEntryPoint(
             ISessionManager sessionManager,
@@ -57,8 +58,9 @@ namespace EmbyUserControl
             // 2. 第一次运行进行自愈和状态同步
             lock (_lock)
             {
-                SyncAndHealUsers(DateTime.Today.ToString("yyyy-MM-dd"));
-                LogConfiguredUserRemainingTimes(DateTime.Today.ToString("yyyy-MM-dd"), "启动配置快照");
+                var now = DateTime.Now;
+                SyncAndHealUsers(now.ToString("yyyy-MM-dd"), now);
+                LogConfiguredUserRemainingTimes(now.ToString("yyyy-MM-dd"), "启动配置快照");
             }
 
             // 3. 订阅事件
@@ -85,19 +87,24 @@ namespace EmbyUserControl
                     // 1. 跨日重置检查
                     if (today != _lastCheckedDate)
                     {
-                        _logger.Info($"检测到日期变更，从 {_lastCheckedDate} 跨入 {today}。开始重置时长并恢复所有用户播放权限...");
+                        _logger.Info($"检测到日期变更，从 {_lastCheckedDate} 跨入 {today}。开始重置时长并恢复插件锁定的用户权限...");
                         _lastCheckedDate = today;
                         ResetAllLimitedUsers(today);
                     }
 
-                    // 2. 状态自愈：同步并纠正用户 EnableMediaPlayback 状态
-                    SyncAndHealUsers(today);
+                    var now = DateTime.Now;
+
+                    // 2. 状态自愈：同步并纠正用户权限状态
+                    SyncAndHealUsers(today, now);
 
                     // 3. 时间累加与超限检测
-                    UpdateAndCheckActiveSessions(today, elapsedSeconds);
+                    UpdateAndCheckActiveSessions(today, now, elapsedSeconds);
 
-                    // 4. 定期持久化
-                    SaveRecords();
+                    // 4. 仅在记录发生变化时持久化
+                    if (_recordsDirty)
+                    {
+                        SaveRecords();
+                    }
                 }
             }
             catch (Exception ex)
@@ -113,13 +120,13 @@ namespace EmbyUserControl
             try
             {
                 string username = e.Session.UserName;
-                string today = DateTime.Today.ToString("yyyy-MM-dd");
+                var now = DateTime.Now;
+                string today = now.ToString("yyyy-MM-dd");
 
                 lock (_lock)
                 {
                     // 检查该用户是否受限
-                    var limit = Plugin.Instance.Configuration.UserLimits
-                        .FirstOrDefault(l => string.Equals(l.Username, username, StringComparison.OrdinalIgnoreCase));
+                    var limit = FindLimit(username);
 
                     if (limit == null)
                     {
@@ -127,16 +134,14 @@ namespace EmbyUserControl
                     }
                     else
                     {
-                        // 查找今日记录
-                        var record = _playRecords.FirstOrDefault(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Date == today);
+                        var record = GetRecord(username, today, false);
                         var watchedSeconds = record == null ? 0 : record.WatchedSeconds;
-                        var limitSeconds = limit.LimitMinutes * 60;
-                        var remainingSeconds = Math.Max(0, limitSeconds - watchedSeconds);
-                        _logger.Info($"[播放开始] 命中受限用户 [{username}]。SessionId={e.Session.Id}，今日已播放={watchedSeconds:0.0} 秒，限制={limitSeconds} 秒，剩余={remainingSeconds:0.0} 秒。");
-                        if (record != null && record.WatchedSeconds >= limit.LimitMinutes * 60)
+                        string reason;
+                        _logger.Info($"[播放开始] 命中受限用户 [{username}]。SessionId={e.Session.Id}，今日已播放={watchedSeconds:0.0} 秒，规则={DescribeLimit(limit)}。");
+                        if (HasTriggeredLimit(limit, record, now, out reason))
                         {
-                            _logger.Info($"受限用户 [{username}] 尝试在已超额情况下播放。今日已播放 {record.WatchedSeconds} 秒，限制 {limit.LimitMinutes} 分钟。立即实施阻断。");
-                            BlockUserPlayback(e.Session, username);
+                            _logger.Info($"受限用户 [{username}] 尝试在已触发限制后播放。原因={reason}。立即实施阻断。");
+                            BlockUserPlayback(e.Session, username, reason);
                         }
                     }
                 }
@@ -147,66 +152,93 @@ namespace EmbyUserControl
             }
         }
 
-        private void UpdateAndCheckActiveSessions(string today, double elapsedSeconds)
+        private void UpdateAndCheckActiveSessions(string today, DateTime now, double elapsedSeconds)
         {
             var sessions = _sessionManager.Sessions.ToList();
-            var activeSessions = sessions
+            var activeUserGroups = sessions
                 .Where(s => !string.IsNullOrEmpty(s.UserName) && s.NowPlayingItem != null && (s.PlayState == null || !s.PlayState.IsPaused))
+                .GroupBy(s => s.UserName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            _logger.Info($"[时间计算] 开始本轮检测。日期={today}，距离上轮={elapsedSeconds:0.0} 秒，Session总数={sessions.Count}，活跃播放Session数={activeSessions.Count}。");
-
-            LogConfiguredUserRemainingTimes(today, "时间计算前");
-
-            foreach (var session in activeSessions)
+            if (activeUserGroups.Count == 0)
             {
-                string username = session.UserName;
+                return;
+            }
+
+            _logger.Info($"[时间计算] 开始本轮检测。日期={today}，距离上轮={elapsedSeconds:0.0} 秒，Session总数={sessions.Count}，活跃播放用户数={activeUserGroups.Count}。");
+
+            foreach (var userGroup in activeUserGroups)
+            {
+                string username = userGroup.Key;
 
                 // 查找是否在限制名单中
-                var limit = Plugin.Instance.Configuration.UserLimits
-                    .FirstOrDefault(l => string.Equals(l.Username, username, StringComparison.OrdinalIgnoreCase));
+                var limit = FindLimit(username);
 
                 if (limit == null)
                 {
-                    _logger.Info($"[时间计算] 活跃播放用户 [{username}] 未配置限制，跳过计时。SessionId={session.Id}。");
                     continue;
                 }
 
-                // 找到限制，按实际定时器间隔累加，避免 timer 延迟导致时间计算漂移。
-                var record = _playRecords.FirstOrDefault(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Date == today);
-                if (record == null)
+                var record = GetRecord(username, today, true);
+
+                var beforeWatchedSeconds = record.WatchedSeconds;
+                string reason;
+                if (HasTriggeredLimit(limit, record, now, out reason))
                 {
-                    record = new PlayRecord
+                    _logger.Info($"受限用户 [{username}] 已触发限制。原因={reason}，累计={record.WatchedSeconds:0.0} 秒，规则={DescribeLimit(limit)}。执行断流与弹窗。");
+                    foreach (var session in userGroup)
                     {
-                        Username = username,
-                        Date = today,
-                        WatchedSeconds = 0
-                    };
-                    _playRecords.Add(record);
+                        BlockUserPlayback(session, username, reason);
+                    }
+                    continue;
                 }
 
-                var limitSeconds = limit.LimitMinutes * 60;
-                var beforeWatchedSeconds = record.WatchedSeconds;
-                record.WatchedSeconds += elapsedSeconds;
-                var remainingSeconds = Math.Max(0, limitSeconds - record.WatchedSeconds);
-                _logger.Info($"[时间计算] 用户 [{username}] 正在播放。SessionId={session.Id}，本轮增加={elapsedSeconds:0.0} 秒，累计={record.WatchedSeconds:0.0}/{limitSeconds} 秒，剩余={remainingSeconds:0.0} 秒。");
-
-                // 判断是否超时
-                if (record.WatchedSeconds >= limit.LimitMinutes * 60)
+                if (HasDurationLimit(limit))
                 {
-                    _logger.Info($"受限用户 [{username}] 播放时长已超额。上轮累计 {beforeWatchedSeconds:0.0} 秒，本轮累计 {record.WatchedSeconds:0.0} 秒，限制 {limit.LimitMinutes} 分钟。执行断流与弹窗。");
-                    BlockUserPlayback(session, username);
+                    // 同一用户多端同时播放时，只按自然时间累加一次。
+                    record.WatchedSeconds += elapsedSeconds;
+                    _recordsDirty = true;
+                }
+
+                if (HasTriggeredLimit(limit, record, now, out reason))
+                {
+                    _logger.Info($"受限用户 [{username}] 已触发限制。原因={reason}，上轮累计={beforeWatchedSeconds:0.0} 秒，本轮累计={record.WatchedSeconds:0.0} 秒，规则={DescribeLimit(limit)}。执行断流与弹窗。");
+                    foreach (var session in userGroup)
+                    {
+                        BlockUserPlayback(session, username, reason);
+                    }
+                }
+                else if (HasDurationLimit(limit))
+                {
+                    var remainingSeconds = Math.Max(0, limit.LimitMinutes * 60 - record.WatchedSeconds);
+                    _logger.Info($"[时间计算] 用户 [{username}] 正在播放，本轮增加={elapsedSeconds:0.0} 秒，累计={record.WatchedSeconds:0.0} 秒，剩余={remainingSeconds:0.0} 秒。");
                 }
             }
-
-            LogConfiguredUserRemainingTimes(today, "时间计算后");
         }
 
-        private void BlockUserPlayback(SessionInfo session, string username)
+        private void BlockUserPlayback(SessionInfo session, string username, string reason)
         {
-            // 1. 发送提示弹框
+            SendLimitMessageAndStop(session);
+
+            // 3. 物理切断播放权限与远程访问权限 (UserPolicy)
+            var user = _userManager.Users.FirstOrDefault(u => string.Equals(u.Name, username, StringComparison.OrdinalIgnoreCase));
+            if (user != null)
+            {
+                var record = GetRecord(username, DateTime.Now.ToString("yyyy-MM-dd"), true);
+                ApplyUserLock(user, record, reason);
+            }
+            else
+            {
+                _logger.Warn($"尝试关闭用户 [{username}] 的播放权限，但未在用户列表中找到该用户。");
+            }
+
+            RevokeUserAccess(username, user);
+        }
+
+        private void SendLimitMessageAndStop(SessionInfo session)
+        {
             string message = string.IsNullOrEmpty(Plugin.Instance.Configuration.TimeoutMessage)
-                ? "您今日的播放时长已达上限，播放已被终止。"
+                ? "当前不在允许播放时间段内，或今日播放时长已达上限，播放已被终止。"
                 : Plugin.Instance.Configuration.TimeoutMessage;
 
             var displayCommand = new GeneralCommand
@@ -259,64 +291,6 @@ namespace EmbyUserControl
             {
                 _logger.Warn($"向 Session {session.Id} 发送 PlaystateCommand Stop 失败: {ex.Message}");
             }
-
-            // 3. 物理切断播放权限与远程访问权限 (UserPolicy)
-            var user = _userManager.Users.FirstOrDefault(u => string.Equals(u.Name, username, StringComparison.OrdinalIgnoreCase));
-            if (user != null)
-            {
-                try
-                {
-                    var policy = user.Policy;
-                    var changed = false;
-                    if (policy.EnableMediaPlayback)
-                    {
-                        policy.EnableMediaPlayback = false;
-                        changed = true;
-                        _logger.Info($"已关闭用户 [{username}] 的播放权限。");
-                    }
-                    else
-                    {
-                        _logger.Info($"用户 [{username}] 的播放权限已经处于关闭状态，无需重复关闭。");
-                    }
-
-                    if (policy.EnableRemoteAccess)
-                    {
-                        policy.EnableRemoteAccess = false;
-                        changed = true;
-                        _logger.Info($"已关闭用户 [{username}] 的远程访问权限。");
-                    }
-                    else
-                    {
-                        _logger.Info($"用户 [{username}] 的远程访问权限已经处于关闭状态，无需重复关闭。");
-                    }
-
-                    if (!policy.IsDisabled)
-                    {
-                        policy.IsDisabled = true;
-                        changed = true;
-                        _logger.Info($"已临时禁用用户 [{username}]，阻止客户端重新登录换取新 Token。");
-                    }
-                    else
-                    {
-                        _logger.Info($"用户 [{username}] 已经处于禁用状态，无需重复禁用。");
-                    }
-
-                    if (changed)
-                    {
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.ErrorException($"修改用户 [{username}] 权限失败: ", ex);
-                }
-            }
-            else
-            {
-                _logger.Warn($"尝试关闭用户 [{username}] 的播放权限，但未在用户列表中找到该用户。");
-            }
-
-            RevokeUserAccess(username, user);
         }
 
         private void RevokeUserAccess(string username, MediaBrowser.Controller.Entities.User user)
@@ -356,124 +330,66 @@ namespace EmbyUserControl
 
         private void ResetAllLimitedUsers(string today)
         {
-            foreach (var limit in Plugin.Instance.Configuration.UserLimits)
+            var allUsers = _userManager.Users.ToList();
+            foreach (var limit in GetConfiguredLimits())
             {
                 string username = limit.Username;
-                var record = _playRecords.FirstOrDefault(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase));
-                if (record != null)
+                var todayRecord = GetRecord(username, today, true);
+                if (Math.Abs(todayRecord.WatchedSeconds) > 0.001)
                 {
-                    record.Date = today;
-                    record.WatchedSeconds = 0;
+                    todayRecord.WatchedSeconds = 0;
+                    _recordsDirty = true;
                 }
-            }
 
-            // 恢复受限用户的播放权限与远程访问权限
-            var allUsers = _userManager.Users.ToList();
-            foreach (var limit in Plugin.Instance.Configuration.UserLimits)
-            {
                 var user = allUsers.FirstOrDefault(u => string.Equals(u.Name, limit.Username, StringComparison.OrdinalIgnoreCase));
                 if (user == null)
                 {
                     continue;
                 }
 
-                try
-                {
-                    var policy = user.Policy;
-                    var changed = false;
-                    if (!policy.EnableMediaPlayback)
-                    {
-                        policy.EnableMediaPlayback = true;
-                        changed = true;
-                        _logger.Info($"[跨日重置] 已恢复用户 [{user.Name}] 的播放权限。");
-                    }
-
-                    if (!policy.EnableRemoteAccess)
-                    {
-                        policy.EnableRemoteAccess = true;
-                        changed = true;
-                        _logger.Info($"[跨日重置] 已恢复用户 [{user.Name}] 的远程访问权限。");
-                    }
-
-                    if (policy.IsDisabled)
-                    {
-                        policy.IsDisabled = false;
-                        changed = true;
-                        _logger.Info($"[跨日重置] 已解除用户 [{user.Name}] 的临时禁用状态。");
-                    }
-
-                    if (changed)
-                    {
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.ErrorException($"[跨日重置] 恢复用户 [{user.Name}] 权限失败: ", ex);
-                }
+                var lockRecord = GetManagedLockRecord(username) ?? todayRecord;
+                ReleaseUserLock(user, lockRecord, "[跨日重置]");
             }
         }
 
-        private void SyncAndHealUsers(string today)
+        private void SyncAndHealUsers(string today, DateTime now)
         {
             var allUsers = _userManager.Users.ToList();
 
-            // 1. 先修复那些被限额且超时的用户的权限（确保状态完全同步）
-            foreach (var limit in Plugin.Instance.Configuration.UserLimits)
+            // 1. 同步受限用户状态：必须同时满足时长限制和允许播放时间段。
+            foreach (var limit in GetConfiguredLimits())
             {
                 string username = limit.Username;
                 var user = allUsers.FirstOrDefault(u => string.Equals(u.Name, username, StringComparison.OrdinalIgnoreCase));
                 if (user == null) continue;
 
-                var record = _playRecords.FirstOrDefault(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Date == today);
-                bool hasExceeded = record != null && record.WatchedSeconds >= limit.LimitMinutes * 60;
+                var record = GetRecord(username, today, false);
+                string reason;
+                bool hasTriggered = HasTriggeredLimit(limit, record, now, out reason);
 
                 try
                 {
-                    var policy = user.Policy;
-                    var changed = false;
-                    if (hasExceeded && policy.EnableMediaPlayback)
+                    if (hasTriggered)
                     {
-                        policy.EnableMediaPlayback = false;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 已超时但权限未关闭，执行补锁关闭权限。");
+                        var lockRecord = GetRecord(username, today, true);
+                        bool changed = ApplyUserLock(user, lockRecord, reason);
+                        bool stoppedSessions = StopActiveSessionsForUser(username);
+                        if (changed || stoppedSessions)
+                        {
+                            RevokeUserAccess(username, user);
+                        }
+                        if (changed)
+                        {
+                            _logger.Info($"[状态自愈] 用户 [{username}] 已触发限制，执行补锁。原因={reason}。");
+                        }
                     }
-                    else if (!hasExceeded && !policy.EnableMediaPlayback)
+                    else
                     {
-                        policy.EnableMediaPlayback = true;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 未超时但权限处于关闭状态，执行解锁开放权限。");
-                    }
-
-                    if (hasExceeded && policy.EnableRemoteAccess)
-                    {
-                        policy.EnableRemoteAccess = false;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 已超时但远程访问未关闭，执行补锁关闭远程访问。");
-                    }
-                    else if (!hasExceeded && !policy.EnableRemoteAccess)
-                    {
-                        policy.EnableRemoteAccess = true;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 未超时但远程访问处于关闭状态，执行解锁开放远程访问。");
-                    }
-
-                    if (hasExceeded && !policy.IsDisabled)
-                    {
-                        policy.IsDisabled = true;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 已超时但未被禁用，执行补锁禁用以阻止重新登录。");
-                    }
-                    else if (!hasExceeded && policy.IsDisabled)
-                    {
-                        policy.IsDisabled = false;
-                        changed = true;
-                        _logger.Info($"[状态自愈] 用户 [{username}] 未超时但处于禁用状态，执行解锁允许登录。");
-                    }
-
-                    if (changed)
-                    {
-                        _userManager.UpdateUserPolicy(user.InternalId, policy);
+                        var lockRecord = GetManagedLockRecord(username);
+                        if (lockRecord != null)
+                        {
+                            ReleaseUserLock(user, lockRecord, "[状态自愈]");
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -486,57 +402,307 @@ namespace EmbyUserControl
             foreach (var user in allUsers)
             {
                 string username = user.Name;
-                bool isLimited = Plugin.Instance.Configuration.UserLimits
+                bool isLimited = GetConfiguredLimits()
                     .Any(l => string.Equals(l.Username, username, StringComparison.OrdinalIgnoreCase));
 
-                if (!isLimited && HasPlayRecord(username))
+                if (!isLimited)
                 {
-                    try
+                    var lockRecord = GetManagedLockRecord(username);
+                    if (lockRecord != null)
                     {
-                        var policy = user.Policy;
-                        var changed = false;
-                        if (!policy.EnableMediaPlayback)
+                        try
                         {
-                            policy.EnableMediaPlayback = true;
-                            changed = true;
-                            _logger.Info($"[自愈修复] 发现未受限普通用户 [{username}] 的播放权限被禁用，现已自动恢复开启。");
+                            ReleaseUserLock(user, lockRecord, "[自愈修复]");
                         }
-
-                        if (!policy.EnableRemoteAccess)
+                        catch (Exception ex)
                         {
-                            policy.EnableRemoteAccess = true;
-                            changed = true;
-                            _logger.Info($"[自愈修复] 发现已移除限制用户 [{username}] 的远程访问被禁用，现已自动恢复开启。");
+                            _logger.ErrorException($"[自愈修复] 恢复普通用户 [{username}] 权限异常: ", ex);
                         }
-
-                        if (policy.IsDisabled)
-                        {
-                            policy.IsDisabled = false;
-                            changed = true;
-                            _logger.Info($"[自愈修复] 发现已移除限制用户 [{username}] 仍处于禁用状态，现已自动解除禁用。");
-                        }
-
-                        if (changed)
-                        {
-                            _userManager.UpdateUserPolicy(user.InternalId, policy);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.ErrorException($"[自愈修复] 恢复普通用户 [{username}] 权限异常: ", ex);
                     }
                 }
             }
         }
 
-        private bool HasPlayRecord(string username)
+        private List<UserLimit> GetConfiguredLimits()
         {
-            return _playRecords.Any(r => string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase));
+            return Plugin.Instance.Configuration.UserLimits ?? new List<UserLimit>();
+        }
+
+        private UserLimit FindLimit(string username)
+        {
+            return GetConfiguredLimits()
+                .FirstOrDefault(l => l != null
+                    && !string.IsNullOrWhiteSpace(l.Username)
+                    && string.Equals(l.Username, username, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private PlayRecord GetRecord(string username, string date, bool create)
+        {
+            var record = _playRecords.FirstOrDefault(r =>
+                string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Date == date);
+
+            if (record == null && create)
+            {
+                record = new PlayRecord
+                {
+                    Username = username,
+                    Date = date,
+                    WatchedSeconds = 0
+                };
+                _playRecords.Add(record);
+                _recordsDirty = true;
+            }
+
+            return record;
+        }
+
+        private PlayRecord GetManagedLockRecord(string username)
+        {
+            return _playRecords.FirstOrDefault(r =>
+                string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase)
+                && (r.PluginLocked || r.HasOriginalPolicySnapshot));
+        }
+
+        private bool HasDurationLimit(UserLimit limit)
+        {
+            return limit != null && limit.LimitMinutes > 0;
+        }
+
+        private bool TryParseTime(string value, out TimeSpan time)
+        {
+            time = TimeSpan.Zero;
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            var parts = value.Trim().Split(':');
+            if (parts.Length != 2)
+            {
+                return false;
+            }
+
+            int hour;
+            int minute;
+            if (!int.TryParse(parts[0], out hour) || !int.TryParse(parts[1], out minute))
+            {
+                return false;
+            }
+
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59)
+            {
+                return false;
+            }
+
+            time = new TimeSpan(hour, minute, 0);
+            return true;
+        }
+
+        private bool TryGetAllowedTimeRange(UserLimit limit, out TimeSpan start, out TimeSpan end, out string displayRange)
+        {
+            start = TimeSpan.Zero;
+            end = TimeSpan.Zero;
+            displayRange = null;
+
+            if (limit == null)
+            {
+                return false;
+            }
+
+            var startText = limit.AllowedStartTime;
+            var endText = limit.AllowedEndTime;
+
+            // 兼容 1.0.1.0 的截止时间配置：截止 22:00 等价于允许 00:00-22:00。
+            if ((string.IsNullOrWhiteSpace(startText) || string.IsNullOrWhiteSpace(endText))
+                && !string.IsNullOrWhiteSpace(limit.CutoffTime))
+            {
+                startText = "00:00";
+                endText = limit.CutoffTime;
+            }
+
+            if (!TryParseTime(startText, out start) || !TryParseTime(endText, out end) || start == end)
+            {
+                return false;
+            }
+
+            displayRange = $"{startText}-{endText}";
+            return true;
+        }
+
+        private bool IsWithinAllowedTimeRange(TimeSpan current, TimeSpan start, TimeSpan end)
+        {
+            if (start < end)
+            {
+                return current >= start && current < end;
+            }
+
+            // 跨午夜时间段，例如 22:00-02:00。
+            return current >= start || current < end;
+        }
+
+        private bool HasTriggeredLimit(UserLimit limit, PlayRecord record, DateTime now, out string reason)
+        {
+            if (HasDurationLimit(limit) && record != null && record.WatchedSeconds >= limit.LimitMinutes * 60)
+            {
+                reason = $"每日播放时长已达到 {limit.LimitMinutes} 分钟";
+                return true;
+            }
+
+            TimeSpan start;
+            TimeSpan end;
+            string displayRange;
+            if (TryGetAllowedTimeRange(limit, out start, out end, out displayRange)
+                && !IsWithinAllowedTimeRange(now.TimeOfDay, start, end))
+            {
+                reason = $"当前时间不在允许播放时间段 {displayRange} 内";
+                return true;
+            }
+
+            reason = null;
+            return false;
+        }
+
+        private string DescribeLimit(UserLimit limit)
+        {
+            var parts = new List<string>();
+            if (HasDurationLimit(limit))
+            {
+                parts.Add($"每日 {limit.LimitMinutes} 分钟");
+            }
+
+            TimeSpan start;
+            TimeSpan end;
+            string displayRange;
+            if (TryGetAllowedTimeRange(limit, out start, out end, out displayRange))
+            {
+                parts.Add($"允许时段 {displayRange}");
+            }
+
+            return parts.Count == 0 ? "未启用有效限制" : string.Join("，", parts.ToArray());
+        }
+
+        private bool ApplyUserLock(MediaBrowser.Controller.Entities.User user, PlayRecord record, string reason)
+        {
+            try
+            {
+                var policy = user.Policy;
+                if (!record.HasOriginalPolicySnapshot)
+                {
+                    record.OriginalEnableMediaPlayback = policy.EnableMediaPlayback;
+                    record.OriginalEnableRemoteAccess = policy.EnableRemoteAccess;
+                    record.OriginalIsDisabled = policy.IsDisabled;
+                    record.HasOriginalPolicySnapshot = true;
+                    _recordsDirty = true;
+                }
+
+                if (!record.PluginLocked || record.LockReason != reason)
+                {
+                    _recordsDirty = true;
+                }
+                record.PluginLocked = true;
+                record.LockReason = reason;
+
+                var changed = false;
+                if (policy.EnableMediaPlayback)
+                {
+                    policy.EnableMediaPlayback = false;
+                    changed = true;
+                }
+
+                if (policy.EnableRemoteAccess)
+                {
+                    policy.EnableRemoteAccess = false;
+                    changed = true;
+                }
+
+                if (!policy.IsDisabled)
+                {
+                    policy.IsDisabled = true;
+                    changed = true;
+                }
+
+                if (changed)
+                {
+                    _userManager.UpdateUserPolicy(user.InternalId, policy);
+                    _logger.Info($"已锁定用户 [{user.Name}] 的播放权限、远程访问和登录状态。原因={reason}。");
+                }
+
+                return changed;
+            }
+            catch (Exception ex)
+            {
+                _logger.ErrorException($"修改用户 [{user.Name}] 权限失败: ", ex);
+                return false;
+            }
+        }
+
+        private bool ReleaseUserLock(MediaBrowser.Controller.Entities.User user, PlayRecord record, string stage)
+        {
+            if (record == null || (!record.PluginLocked && !record.HasOriginalPolicySnapshot))
+            {
+                return false;
+            }
+
+            try
+            {
+                var policy = user.Policy;
+                var changed = false;
+
+                if (policy.EnableMediaPlayback != record.OriginalEnableMediaPlayback)
+                {
+                    policy.EnableMediaPlayback = record.OriginalEnableMediaPlayback;
+                    changed = true;
+                }
+
+                if (policy.EnableRemoteAccess != record.OriginalEnableRemoteAccess)
+                {
+                    policy.EnableRemoteAccess = record.OriginalEnableRemoteAccess;
+                    changed = true;
+                }
+
+                if (policy.IsDisabled != record.OriginalIsDisabled)
+                {
+                    policy.IsDisabled = record.OriginalIsDisabled;
+                    changed = true;
+                }
+
+                if (changed)
+                {
+                    _userManager.UpdateUserPolicy(user.InternalId, policy);
+                    _logger.Info($"{stage} 已按插件锁定前状态恢复用户 [{user.Name}] 权限。");
+                }
+
+                record.PluginLocked = false;
+                record.HasOriginalPolicySnapshot = false;
+                record.LockReason = null;
+                _recordsDirty = true;
+
+                return changed;
+            }
+            catch (Exception ex)
+            {
+                _logger.ErrorException($"{stage} 恢复用户 [{user.Name}] 权限失败: ", ex);
+                return false;
+            }
+        }
+
+        private bool StopActiveSessionsForUser(string username)
+        {
+            var userSessions = _sessionManager.Sessions
+                .Where(s => string.Equals(s.UserName, username, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (var session in userSessions)
+            {
+                SendLimitMessageAndStop(session);
+            }
+
+            return userSessions.Count > 0;
         }
 
         private void LogConfiguredUserRemainingTimes(string today, string stage)
         {
-            var limits = Plugin.Instance.Configuration.UserLimits ?? new List<UserLimit>();
+            var limits = GetConfiguredLimits();
             if (limits.Count == 0)
             {
                 _logger.Info($"[{stage}] 当前没有配置任何受限用户。");
@@ -553,9 +719,15 @@ namespace EmbyUserControl
 
                 var record = _playRecords.FirstOrDefault(r => string.Equals(r.Username, limit.Username, StringComparison.OrdinalIgnoreCase) && r.Date == today);
                 var watchedSeconds = record == null ? 0 : record.WatchedSeconds;
-                var limitSeconds = limit.LimitMinutes * 60;
-                var remainingSeconds = Math.Max(0, limitSeconds - watchedSeconds);
-                _logger.Info($"[{stage}] 受限用户 [{limit.Username}] 今日已播放={watchedSeconds:0.0} 秒，限制={limitSeconds} 秒（{limit.LimitMinutes} 分钟），剩余={remainingSeconds:0.0} 秒。");
+                var remainingText = "未启用时长限制";
+                if (HasDurationLimit(limit))
+                {
+                    var limitSeconds = limit.LimitMinutes * 60;
+                    var remainingSeconds = Math.Max(0, limitSeconds - watchedSeconds);
+                    remainingText = $"时长剩余={remainingSeconds:0.0} 秒";
+                }
+
+                _logger.Info($"[{stage}] 受限用户 [{limit.Username}] 今日已播放={watchedSeconds:0.0} 秒，规则={DescribeLimit(limit)}，{remainingText}。");
             }
         }
 
@@ -594,10 +766,30 @@ namespace EmbyUserControl
                     Directory.CreateDirectory(directory);
                 }
 
-                using (var stream = File.Create(_recordsFilePath))
+                var tempFilePath = _recordsFilePath + ".tmp";
+                using (var stream = File.Create(tempFilePath))
                 {
                     _jsonSerializer.SerializeToStream(_playRecords, stream);
                 }
+
+                if (File.Exists(_recordsFilePath))
+                {
+                    try
+                    {
+                        File.Replace(tempFilePath, _recordsFilePath, null);
+                    }
+                    catch
+                    {
+                        File.Copy(tempFilePath, _recordsFilePath, true);
+                        File.Delete(tempFilePath);
+                    }
+                }
+                else
+                {
+                    File.Move(tempFilePath, _recordsFilePath);
+                }
+
+                _recordsDirty = false;
             }
             catch (Exception ex)
             {

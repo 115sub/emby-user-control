@@ -5,7 +5,7 @@
     <AssemblyName>EmbyUserControl</AssemblyName>
     <RootNamespace>EmbyUserControl</RootNamespace>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>1.0.0.$([System.DateTime]::UtcNow.ToString("ddHHmm"))</Version>
+    <Version>1.0.6.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

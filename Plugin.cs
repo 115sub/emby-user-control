@@ -25,31 +25,6 @@ namespace EmbyUserControl
         {
             Instance = this;
 
-            // 调试用：提取嵌入资源到物理路径，验证打包是否完整
-            try
-            {
-                var assembly = GetType().Assembly;
-                var resourceName = GetType().Namespace + ".Configuration.configPage.html";
-                using (var stream = assembly.GetManifestResourceStream(resourceName))
-                {
-                    if (stream != null)
-                    {
-                        using (var reader = new StreamReader(stream, System.Text.Encoding.UTF8))
-                        {
-                            var htmlContent = reader.ReadToEnd();
-                            var outputPath = Path.Combine(applicationPaths.PluginConfigurationsPath, "debug_configPage_extracted.html");
-                            File.WriteAllText(outputPath, htmlContent, System.Text.Encoding.UTF8);
-                            
-                            // 同时输出到项目目录供快速查看
-                            File.WriteAllText("/Users/jianxiong.cao/work/fun/emby-user-control/debug_configPage_extracted.html", htmlContent, System.Text.Encoding.UTF8);
-                        }
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                // 忽略异常，防崩
-            }
         }
 
         public IEnumerable<PluginPageInfo> GetPages()

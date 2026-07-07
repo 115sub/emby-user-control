@@ -22,14 +22,17 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
         }
 
         tbody.innerHTML = limits.map(function (limit, index) {
-            return '<tr style="border-bottom:1px solid #edf1f5;">'
-                + '<td style="padding:14px 10px;font-weight:700;color:#1f2933;">' + escapeHtml(limit.Username) + '</td>'
-                + '<td style="padding:14px 10px;color:#3b4a5a;">' + escapeHtml(limit.LimitMinutes) + ' 分钟</td>'
-                + '<td style="padding:14px 10px;text-align:right;">'
-                + '<button type="button" class="raised btnDeleteLimit" data-index="' + index + '" style="padding:0.35em 0.9em;background:#d32f2f;color:#fff;border-radius:6px;border:none;cursor:pointer;">删除</button>'
+            var minutesText = parseInt(limit.LimitMinutes, 10) > 0 ? escapeHtml(limit.LimitMinutes) + ' 分钟' : '不限制';
+            var rangeText = getAllowedRangeText(limit);
+            return '<tr class="eucRuleRow">'
+                + '<td class="eucUserCell">' + escapeHtml(limit.Username) + '</td>'
+                + '<td>' + minutesText + '</td>'
+                + '<td>' + rangeText + '</td>'
+                + '<td class="eucActionCell">'
+                + '<button type="button" is="emby-button" class="btnDeleteLimit eucDeleteButton" data-index="' + index + '">删除</button>'
                 + '</td>'
                 + '</tr>';
-        }).join('') || '<tr><td colspan="3" style="padding:1.5em 0;text-align:center;color:#7b8794;">暂无受限用户。请选择用户和分钟数，然后点击“加入列表”。</td></tr>';
+        }).join('') || '<tr><td colspan="4" class="eucEmptyCell">暂无受限用户。请选择用户并设置时长或允许播放时间段，然后点击“加入列表”。</td></tr>';
     }
 
     function setStatus(view, message, kind) {
@@ -44,6 +47,26 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
             status.classList.add(kind);
         }
         status.textContent = message || '';
+    }
+
+    function isValidTime(value) {
+        if (!value) {
+            return true;
+        }
+
+        return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+    }
+
+    function getAllowedRangeText(limit) {
+        var start = limit.AllowedStartTime || '';
+        var end = limit.AllowedEndTime || '';
+
+        if ((!start || !end) && limit.CutoffTime) {
+            start = '00:00';
+            end = limit.CutoffTime;
+        }
+
+        return start && end ? escapeHtml(start + '-' + end) : '不限制';
     }
 
     function formatUserLabel(user) {
@@ -90,10 +113,16 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
             var txt = view.querySelector('#txtTimeoutMessage');
 
             if (txt) {
-                txt.value = config.TimeoutMessage || '您今日的播放时长已达上限';
+                txt.value = config.TimeoutMessage || '当前不在允许播放时间段内，或今日播放时长已达上限，播放已被终止。';
             }
 
-            instance.limits = config.UserLimits || [];
+            instance.limits = (config.UserLimits || []).map(function (limit) {
+                if ((!limit.AllowedStartTime || !limit.AllowedEndTime) && limit.CutoffTime) {
+                    limit.AllowedStartTime = '00:00';
+                    limit.AllowedEndTime = limit.CutoffTime;
+                }
+                return limit;
+            });
             render(view, instance.limits);
             setStatus(view, instance.limits.length ? '已载入 ' + instance.limits.length + ' 条限制规则。' : '当前还没有受限用户。', instance.limits.length ? 'isOk' : '');
 
@@ -122,11 +151,29 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
         var view = instance.view;
         var select = view.querySelector('#selectUser');
         var input = view.querySelector('#inputLimitMinutes');
+        var startInput = view.querySelector('#inputAllowedStartTime');
+        var endInput = view.querySelector('#inputAllowedEndTime');
         var user = select ? select.value : '';
-        var minutes = input ? parseInt(input.value, 10) : 0;
+        var rawMinutes = input ? String(input.value || '').trim() : '';
+        var minutes = rawMinutes ? parseInt(rawMinutes, 10) : 0;
+        var allowedStartTime = startInput ? String(startInput.value || '').trim() : '';
+        var allowedEndTime = endInput ? String(endInput.value || '').trim() : '';
+        var hasAllowedRange = allowedStartTime || allowedEndTime;
 
-        if (!user || isNaN(minutes) || minutes <= 0) {
-            setStatus(view, '请选择用户，并填写大于 0 的分钟数。', 'isWarning');
+        if (!user || isNaN(minutes) || minutes < 0 || (!minutes && !hasAllowedRange)) {
+            setStatus(view, '请选择用户，并至少设置一个大于 0 的分钟数或允许播放时间段。', 'isWarning');
+            return;
+        }
+        if ((allowedStartTime && !allowedEndTime) || (!allowedStartTime && allowedEndTime)) {
+            setStatus(view, '允许播放时间段需要同时填写开始和结束时间。', 'isWarning');
+            return;
+        }
+        if (!isValidTime(allowedStartTime) || !isValidTime(allowedEndTime)) {
+            setStatus(view, '时间格式应为 HH:mm，例如 19:30。', 'isWarning');
+            return;
+        }
+        if (allowedStartTime && allowedStartTime === allowedEndTime) {
+            setStatus(view, '允许播放时间段的开始和结束时间不能相同。', 'isWarning');
             return;
         }
 
@@ -141,14 +188,20 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
 
         if (existing) {
             existing.LimitMinutes = minutes;
+            existing.AllowedStartTime = allowedStartTime;
+            existing.AllowedEndTime = allowedEndTime;
+            existing.CutoffTime = '';
             render(view, instance.limits);
-            setStatus(view, '已更新 ' + user + ' 的限制为 ' + minutes + ' 分钟，点击“保存配置”后生效。', 'isOk');
+            setStatus(view, '已更新 ' + user + ' 的限制，点击“保存配置”后生效。', 'isOk');
             return;
         }
 
         instance.limits.push({
             Username: user,
-            LimitMinutes: minutes
+            LimitMinutes: minutes,
+            AllowedStartTime: allowedStartTime,
+            AllowedEndTime: allowedEndTime,
+            CutoffTime: ''
         });
 
         render(view, instance.limits);
@@ -159,10 +212,25 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-select'], func
         var view = instance.view;
         var select = view.querySelector('#selectUser');
         var input = view.querySelector('#inputLimitMinutes');
+        var startInput = view.querySelector('#inputAllowedStartTime');
+        var endInput = view.querySelector('#inputAllowedEndTime');
         var user = select ? select.value : '';
-        var minutes = input ? parseInt(input.value, 10) : 0;
+        var rawMinutes = input ? String(input.value || '').trim() : '';
+        var minutes = rawMinutes ? parseInt(rawMinutes, 10) : 0;
+        var allowedStartTime = startInput ? String(startInput.value || '').trim() : '';
+        var allowedEndTime = endInput ? String(endInput.value || '').trim() : '';
+        var hasAllowedRange = allowedStartTime || allowedEndTime;
 
-        if (!user || isNaN(minutes) || minutes <= 0) {
+        if (!user || isNaN(minutes) || minutes < 0 || (!minutes && !hasAllowedRange)) {
+            return false;
+        }
+        if ((allowedStartTime && !allowedEndTime) || (!allowedStartTime && allowedEndTime)) {
+            return false;
+        }
+        if (!isValidTime(allowedStartTime) || !isValidTime(allowedEndTime)) {
+            return false;
+        }
+        if (allowedStartTime && allowedStartTime === allowedEndTime) {
             return false;
         }
 

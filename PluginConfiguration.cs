@@ -11,7 +11,7 @@ namespace EmbyUserControl
         public PluginConfiguration()
         {
             UserLimits = new List<UserLimit>();
-            TimeoutMessage = "您今日的播放时长已达上限，播放已被终止。";
+            TimeoutMessage = "当前不在允许播放时间段内，或今日播放时长已达上限，播放已被终止。";
         }
     }
 }
